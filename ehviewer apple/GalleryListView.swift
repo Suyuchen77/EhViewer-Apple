@@ -268,7 +268,10 @@ struct GalleryListView: View {
             let favorited = userInfo["favorited"] as? Bool ?? false
             let slot = userInfo["slot"] as? Int ?? -1
             if let index = viewModel.galleries.firstIndex(where: { $0.gid == gid }) {
-                viewModel.galleries[index].favoriteSlot = favorited ? slot : -1
+                // 不要在 @Observable 数组上做下标 inout 修改（issue #15 同类陷阱）
+                var updated = viewModel.galleries
+                updated[index].favoriteSlot = favorited ? slot : -1
+                viewModel.galleries = updated
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: GalleryActionService.siteChangedNotification)) { _ in
@@ -1477,10 +1480,21 @@ class GalleryListViewModel {
         didSet {
             // 里面还会再写一次 galleries，靠这个标记挡住重入
             guard !isApplyingFilters else { return }
+
+            // ⚠️ 不能在 didSet 里用 `apply(to: &galleries)`：
+            //    `@Observable` 的 `_modify` 访问器（append / 下标修改）仍在
+            //    持有 galleries 的独占访问，再取一次 inout 会触发
+            //    “Simultaneous accesses” 运行时陷阱；Debug 不报，Release
+            //    在「加载更多」append 时稳定 SIGTRAP（issue #15）。
+            //    这里改成对副本过滤 + 整体赋值。
+            let before = galleries.count
+            let filtered = galleries.filter { !GalleryFilterEngine.shared.shouldHide($0) }
+            filteredOutCount = before - filtered.count
+
+            guard filtered.count != before else { return }
             isApplyingFilters = true
-            defer { isApplyingFilters = false }
-            let hidden = GalleryFilterEngine.shared.apply(to: &galleries)
-            filteredOutCount = hidden
+            galleries = filtered
+            isApplyingFilters = false
         }
     }
 
@@ -1907,7 +1921,12 @@ class GalleryListViewModel {
                     return
                 }
 
-                self.galleries.append(contentsOf: newGalleries)
+                // ⚠️ 不要用 self.galleries.append(...)：在 @Observable 的
+                //    `_modify` 独占访问期间触发 didSet 会 SIGTRAP（issue #15）。
+                //    先改副本，再整体赋值。
+                var updated = self.galleries
+                updated.append(contentsOf: newGalleries)
+                self.galleries = updated
                 self.prevHref = result.prevHref
                 self.nextHref = result.nextHref
                 self.totalPages = result.pages
@@ -2310,7 +2329,10 @@ class GalleryListViewModel {
                 self.galleries = result.galleries
                 recordFavoriteSyncIfNeeded(mode: mode)
             } else {
-                self.galleries.append(contentsOf: result.galleries)
+                // 同上：避免 @Observable 的 _modify 与 didSet 重入
+                var updated = self.galleries
+                updated.append(contentsOf: result.galleries)
+                self.galleries = updated
             }
             self.prevHref = result.prevHref
             self.nextHref = result.nextHref
