@@ -72,21 +72,26 @@ public final class EhCookieManager: @unchecked Sendable {
     /// 已经有值就不覆盖——迁移期间旧版本留在 Cookie 罐里的持久 Cookie
     /// 仍然有效，此时应该以它为准并顺手写进钥匙串。
     private func restoreCredentialsFromKeychain() {
-        // 钥匙串用不了时什么都不做：此时认证 Cookie 走的是持久 Cookie，
-        // 它们本来就还在罐子里
-        guard EhCredentialStore.isAvailable else { return }
-
         let existing = getCookies(for: Self.domainEhentai)
+
+        // 先检查 Cookie 罐里是否已有凭据（可能是持久 Cookie）
         if existing[Self.keyIPBMemberId] != nil, existing[Self.keyIPBPassHash] != nil {
-            // 旧版本遗留的持久 Cookie：只有钥匙串确认能存能读，才换成会话副本；
-            // 否则保留持久 Cookie，避免「迁移失败 → 下次启动登出」。
+            // 旧版本遗留的持久 Cookie：保存到所有可用的存储（钥匙串 + 文件）
             let creds = EhCredentials(memberId: existing[Self.keyIPBMemberId],
                                       passHash: existing[Self.keyIPBPassHash],
                                       igneous: igneous)
-            let saved = EhCredentialStore.save(creds)
+
+            // 尝试保存到钥匙串（尽力）
+            if EhCredentialStore.isAvailable {
+                _ = EhCredentialStore.save(creds)
+            }
+
+            // 保存到文件作为备份
+            _ = EhCredentialFileStore.save(creds)
+
             if Self.persistAuthCookies {
                 rewriteAuthCookiesAsPersistent(creds)
-            } else if saved && EhCredentialStore.load() != nil {
+            } else if EhCredentialStore.isAvailable, EhCredentialStore.load() != nil {
                 rewriteAuthCookiesAsSession(creds)
             } else {
                 EhCookieManager.credentialPersistenceFailed = true
@@ -94,11 +99,24 @@ public final class EhCookieManager: @unchecked Sendable {
             return
         }
 
-        guard let creds = EhCredentialStore.load(), !creds.isEmpty else { return }
+        // Cookie 罐里没有，尝试从存储恢复
+        // 优先从钥匙串读取，如果失败则从文件读取
+        var creds: EhCredentials?
+
+        if EhCredentialStore.isAvailable {
+            creds = EhCredentialStore.load()
+        }
+
+        if creds == nil || creds!.isEmpty {
+            creds = EhCredentialFileStore.load()
+        }
+
+        guard let loadedCreds = creds, !loadedCreds.isEmpty else { return }
+
         if Self.persistAuthCookies {
-            rewriteAuthCookiesAsPersistent(creds)
+            rewriteAuthCookiesAsPersistent(loadedCreds)
         } else {
-            rewriteAuthCookiesAsSession(creds)
+            rewriteAuthCookiesAsSession(loadedCreds)
         }
     }
 
@@ -294,7 +312,10 @@ public final class EhCookieManager: @unchecked Sendable {
         // 兼容模式：登录凭据同时写钥匙串（尽力）和持久 Cookie。
         // 不走「会话 Cookie + 钥匙串」那条路，避免重签后钥匙串不可用导致登出。
         if Self.persistAuthCookies {
+            // 尝试所有可用的存储方式
             _ = EhCredentialStore.save(creds)
+            _ = EhCredentialFileStore.save(creds)
+
             removePersistedAuthCookies()
             rewriteAuthCookiesAsPersistent(creds)
             return true
@@ -302,6 +323,7 @@ public final class EhCookieManager: @unchecked Sendable {
 
         // 钥匙串用不上：保持持久 Cookie，保证重启后还在
         guard EhCredentialStore.isAvailable else {
+            _ = EhCredentialFileStore.save(creds)
             removePersistedAuthCookies()
             rewriteAuthCookiesAsPersistent(creds)
             return false
@@ -389,8 +411,9 @@ public final class EhCookieManager: @unchecked Sendable {
         clearCookies(for: Self.domainEhentai)
         clearCookies(for: Self.domainExhentai)
         clearCookies(for: Self.domainForums)
-        // 钥匙串里的凭据也要一起清，否则下次启动又被恢复回来
+        // 清除所有存储：钥匙串 + 文件备份
         EhCredentialStore.clear()
+        EhCredentialFileStore.clear()
     }
 
     /// 清除 igneous Cookie — Sad Panda 检测后自动调用 (V-15)

@@ -133,3 +133,47 @@ public enum EhCredentialStore {
         return status == errSecSuccess || status == errSecItemNotFound
     }
 }
+
+// MARK: - 文件备份存储（钥匙串不可用时的兜底）
+
+public enum EhCredentialFileStore {
+    private static let fileName = "eh_credentials.json"
+
+    private static var fileURL: URL? {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        // 确保目录存在
+        try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        return appSupport.appendingPathComponent(fileName)
+    }
+
+    /// 保存凭据到文件
+    @discardableResult
+    public static func save(_ credentials: EhCredentials) -> Bool {
+        guard !credentials.isEmpty, let url = fileURL else { return false }
+        guard let data = try? JSONEncoder().encode(credentials) else { return false }
+
+        do {
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 从文件读取凭据
+    public static func load() -> EhCredentials? {
+        guard let url = fileURL else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(EhCredentials.self, from: data)
+    }
+
+    /// 清除文件中的凭据
+    @discardableResult
+    public static func clear() -> Bool {
+        guard let url = fileURL else { return false }
+        try? FileManager.default.removeItem(at: url)
+        return true
+    }
+}
