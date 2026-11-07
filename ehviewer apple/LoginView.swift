@@ -282,6 +282,38 @@ struct LoginView: View {
     }
 }
 
+// MARK: - 获取 igneous Cookie
+
+/// 登录后主动访问 ExHentai 获取 igneous cookie
+/// igneous 是 ExHentai 访问权限的关键，只有在实际访问 exhentai.org 时服务器才会设置
+private func fetchIgneousCookie() async throws {
+    guard let url = URL(string: "https://exhentai.org/") else { return }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+    request.timeoutInterval = 10
+
+    // 发起请求，让服务器设置 igneous cookie
+    let (_, response) = try await URLSession.shared.data(for: request)
+
+    // 检查是否成功获取 igneous
+    if let httpResponse = response as? HTTPURLResponse,
+       httpResponse.statusCode == 200,
+       let igneous = EhCookieManager.shared.igneous,
+       !igneous.isEmpty,
+       igneous.lowercased() != "mystery" {
+        // igneous 获取成功，保存到所有存储
+        let creds = EhCredentials(
+            memberId: EhCookieManager.shared.memberId,
+            passHash: EhCookieManager.shared.passHash,
+            igneous: igneous
+        )
+        _ = EhCredentialStore.save(creds)
+        _ = EhCredentialFileStore.save(creds)
+    }
+}
+
 // MARK: - 账号密码登录
 
 struct PasswordLoginView: View {
@@ -411,37 +443,6 @@ struct PasswordLoginView: View {
 
         isLoading = false
     }
-
-    /// 登录后主动访问 ExHentai 获取 igneous cookie
-    /// igneous 是 ExHentai 访问权限的关键，只有在实际访问 exhentai.org 时服务器才会设置
-    private func fetchIgneousCookie() async throws {
-        guard let url = URL(string: "https://exhentai.org/") else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 10
-
-        // 发起请求，让服务器设置 igneous cookie
-        let (_, response) = try await URLSession.shared.data(for: request)
-
-        // 检查是否成功获取 igneous
-        if let httpResponse = response as? HTTPURLResponse,
-           httpResponse.statusCode == 200,
-           let igneous = EhCookieManager.shared.igneous,
-           !igneous.isEmpty,
-           igneous.lowercased() != "mystery" {
-            // igneous 获取成功，保存到所有存储
-            let creds = EhCredentials(
-                memberId: EhCookieManager.shared.memberId,
-                passHash: EhCookieManager.shared.passHash,
-                igneous: igneous
-            )
-            _ = EhCredentialStore.save(creds)
-            _ = EhCredentialFileStore.save(creds)
-        }
-    }
-
 }
 
 // MARK: - WebView 登录 (对齐 Android WebView 登录方式)
