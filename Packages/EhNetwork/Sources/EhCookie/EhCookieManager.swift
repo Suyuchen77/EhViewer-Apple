@@ -70,12 +70,17 @@ public final class EhCookieManager: @unchecked Sendable {
 
         let existing = getCookies(for: Self.domainEhentai)
         if existing[Self.keyIPBMemberId] != nil, existing[Self.keyIPBPassHash] != nil {
-            // 旧版本遗留的持久 Cookie：迁移到钥匙串，并把落盘的那份换成会话副本
+            // 旧版本遗留的持久 Cookie：只有钥匙串确认能存能读，才换成会话副本；
+            // 否则保留持久 Cookie，避免「迁移失败 → 下次启动登出」。
             let creds = EhCredentials(memberId: existing[Self.keyIPBMemberId],
                                       passHash: existing[Self.keyIPBPassHash],
                                       igneous: igneous)
-            EhCredentialStore.save(creds)
-            rewriteAuthCookiesAsSession(creds)
+            let saved = EhCredentialStore.save(creds)
+            if saved && EhCredentialStore.load() != nil {
+                rewriteAuthCookiesAsSession(creds)
+            } else {
+                EhCookieManager.credentialPersistenceFailed = true
+            }
             return
         }
 
@@ -89,11 +94,13 @@ public final class EhCookieManager: @unchecked Sendable {
     /// 进程发生优先级反转）。但启动时恢复凭据这条路径上不能异步：
     /// RootView 在 init 里同步读 Cookie 罐来判断登录态，写入还排在队列里
     /// 的话，它看到的就是一个空罐子 —— 明明登录着，App 却显示未登录。
-    private func setCookieSync(name: String, value: String, domain: String, path: String = "/") {
+    private func setCookieSync(name: String, value: String, domain: String, path: String = "/",
+                              forcePersistent: Bool = false) {
         var properties: [HTTPCookiePropertyKey: Any] = [
             .name: name, .value: value, .domain: domain, .path: path, .secure: "TRUE",
         ]
-        if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable {
+        if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable,
+           !forcePersistent, !Self.credentialPersistenceFailed {
             properties[.discard] = "TRUE"
         } else {
             properties[.expires] = Date.distantFuture
@@ -116,6 +123,27 @@ public final class EhCookieManager: @unchecked Sendable {
         }
         if let igneous = creds.igneous {
             setCookieSync(name: Self.keyIgneous, value: igneous, domain: Self.domainExhentai)
+        }
+    }
+
+    /// 钥匙串不可靠时的兜底：把认证 Cookie 写成持久 Cookie。
+    /// 牺牲「容器里不落 pass hash」的安全性，换「重启后不掉登录」。
+    private func rewriteAuthCookiesAsPersistent(_ creds: EhCredentials) {
+        if let memberId = creds.memberId {
+            setCookieSync(name: Self.keyIPBMemberId, value: memberId,
+                          domain: Self.domainEhentai, forcePersistent: true)
+            setCookieSync(name: Self.keyIPBMemberId, value: memberId,
+                          domain: Self.domainExhentai, forcePersistent: true)
+        }
+        if let passHash = creds.passHash {
+            setCookieSync(name: Self.keyIPBPassHash, value: passHash,
+                          domain: Self.domainEhentai, forcePersistent: true)
+            setCookieSync(name: Self.keyIPBPassHash, value: passHash,
+                          domain: Self.domainExhentai, forcePersistent: true)
+        }
+        if let igneous = creds.igneous {
+            setCookieSync(name: Self.keyIgneous, value: igneous,
+                          domain: Self.domainExhentai, forcePersistent: true)
         }
     }
 
@@ -201,13 +229,14 @@ public final class EhCookieManager: @unchecked Sendable {
             .path: path,
             .secure: "TRUE",
         ]
-        if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable {
+        if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable,
+           !Self.credentialPersistenceFailed {
             // 认证 Cookie 写成会话 Cookie：不落盘，容器里的
             // Cookies.binarycookies 因此不再有明文 pass hash。
             // 持久副本在钥匙串里，下次启动由它恢复。
             properties[.discard] = "TRUE"
         } else {
-            // 钥匙串不可用时退回旧行为（持久 Cookie）。
+            // 钥匙串不可用/写入不可靠时退回旧行为（持久 Cookie）。
             // 安全性回到改动前的水平，但登录不会丢——两害相权，
             // 悄悄把用户登出比 Cookie 落盘更糟。
             properties[.expires] = Date.distantFuture
@@ -248,13 +277,22 @@ public final class EhCookieManager: @unchecked Sendable {
         let creds = EhCredentials(memberId: memberId, passHash: passHash, igneous: igneous)
         guard !creds.isEmpty else { return false }
 
-        // 钥匙串用不上时保持持久 Cookie（否则重启即登出），不要改写
-        guard EhCredentialStore.isAvailable else { return false }
+        // 钥匙串用不上：保持持久 Cookie，保证重启后还在
+        guard EhCredentialStore.isAvailable else {
+            removePersistedAuthCookies()
+            rewriteAuthCookiesAsPersistent(creds)
+            return false
+        }
 
-        // 存不进去就绝对不能把 Cookie 换成会话副本——那样重启即登出，
-        // 而且用户完全不知道发生了什么。
-        guard EhCredentialStore.save(creds) else {
+        // 关键：不仅看 save 的返回值，还要立刻读回来验证。
+        // 某些 sideload 签名下 SecItemAdd 返回成功、实际却读不到；
+        // 这时如果按「成功」处理，就会把 Cookie 换成会话副本，重启即登出。
+        let saved = EhCredentialStore.save(creds)
+        let readable = saved && EhCredentialStore.load() != nil
+        guard readable else {
             EhCookieManager.credentialPersistenceFailed = true
+            removePersistedAuthCookies()
+            rewriteAuthCookiesAsPersistent(creds)
             return false
         }
 
