@@ -1,0 +1,76 @@
+name: Repro Issue 15
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          LATEST=${LATEST:-/Applications/Xcode.app}
+          sudo xcode-select -s "$LATEST"
+          xcodebuild -version
+
+      - name: Resolve packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project "ehviewer apple.xcodeproj" \
+            -scheme "Issue15"
+
+      - name: List simulators
+        run: xcrun simctl list devices available | grep -E 'iPhone' | head -30 || true
+
+      - name: Run repro UI test
+        run: |
+          set -o pipefail
+          DEVICE=$(xcrun simctl list devices available \
+            | sed -n 's/^ *\(iPhone [0-9][0-9]*\( Pro\)\{0,1\}\) (.*/\1/p' \
+            | sort -u | tail -1)
+          DEVICE=${DEVICE:-iPhone 17 Pro}
+          echo "Using simulator: $DEVICE"
+          xcodebuild test \
+            -project "ehviewer apple.xcodeproj" \
+            -scheme "Issue15" \
+            -destination "platform=iOS Simulator,name=$DEVICE,OS=latest" \
+            -only-testing:'ehviewer appleUITests/Issue15ReproTests/testHomeScrollToBottom' \
+            -resultBundlePath "$RUNNER_TEMP/Issue15.xcresult" \
+            2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Collect crash logs
+        if: always()
+        run: |
+          echo "== host DiagnosticReports =="
+          find "$HOME/Library/Logs/DiagnosticReports" -type f -mmin -120 -name '*.ips' -print 2>/dev/null || true
+          find "$HOME/Library/Logs/DiagnosticReports" -type f -mmin -120 -name '*.ips' -exec sh -c 'echo "===== $1 ====="; head -300 "$1"' _ {} \; 2>/dev/null || true
+
+          echo "== simulator CrashReporter =="
+          find "$HOME/Library/Developer/CoreSimulator/Devices" -type f -mmin -120 \( -name '*.ips' -o -name '*.crash' \) -print 2>/dev/null | head -50 || true
+
+          echo "== xcresult summary =="
+          if [ -d "$RUNNER_TEMP/Issue15.xcresult" ]; then
+            xcrun xcresulttool get test-results summary --path "$RUNNER_TEMP/Issue15.xcresult" 2>/dev/null || true
+          fi
+
+          echo "== last 120 lines of test log =="
+          tail -120 "$RUNNER_TEMP/test.log" 2>/dev/null || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue15-diagnostics
+          path: |
+            ${{ runner.temp }}/Issue15.xcresult
+            ${{ runner.temp }}/test.log
+          retention-days: 7
+          if-no-files-found: warn
