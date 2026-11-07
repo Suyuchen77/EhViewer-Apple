@@ -608,16 +608,22 @@ struct GalleryListView: View {
                 }
                 .listRowInsets(EdgeInsets())
                 .listRowSeparator(.hidden)
+                .onAppear {
+                    // 只有「最后一行」进入可视区域时才加载下一页。
+                    // 不要用底部 ProgressView 的 .task 触发：列表每追加一页，
+                    // spinner 行都会被重建并再次触发，形成无人操作的连续翻页
+                    // （issue #15 中 Release 下的追加崩溃就是被这个循环放大）。
+                    guard viewModel.hasMore, !viewModel.isLoading,
+                          gallery.gid == viewModel.galleries.last?.gid else { return }
+                    Task { await viewModel.loadMore(mode: effectiveMode) }
+                }
             }
 
-            // 加载更多
+            // 加载更多（仅视觉指示，触发在上方最后一行的 onAppear）
             if viewModel.hasMore {
                 ProgressView()
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .task {
-                        await viewModel.loadMore(mode: effectiveMode)
-                    }
                     .listRowSeparator(.hidden)
             }
         }
@@ -681,15 +687,17 @@ struct GalleryListView: View {
                         highlightedTags: activeSearchTags
                     )
                                 .tag(gallery)
+                                .onAppear {
+                                    guard viewModel.hasMore, !viewModel.isLoading,
+                                          gallery.gid == viewModel.galleries.last?.gid else { return }
+                                    Task { await viewModel.loadMore(mode: effectiveMode) }
+                                }
                         }
 
                         if viewModel.hasMore {
                             ProgressView()
                                 .frame(maxWidth: .infinity)
                                 .padding()
-                                .task {
-                                    await viewModel.loadMore(mode: effectiveMode)
-                                }
                         }
                     }
                     .listStyle(.sidebar)
