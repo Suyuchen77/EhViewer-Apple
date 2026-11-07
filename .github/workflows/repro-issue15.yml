@@ -1,6 +1,8 @@
 name: Repro Issue 15
 
 on:
+  push:
+    branches: [repro/issue-15]
   workflow_dispatch:
 
 permissions:
