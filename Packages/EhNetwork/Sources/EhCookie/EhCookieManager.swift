@@ -37,6 +37,14 @@ public final class EhCookieManager: @unchecked Sendable {
         keyIPBMemberId, keyIPBPassHash, keyIgneous,
     ]
 
+    /// 强制认证 Cookie 走持久化存储。
+    ///
+    /// 这个构建是给 sideload/重签环境用的：钥匙串在重签后经常不可用，
+    /// 而认证 Cookie 被写成会话 Cookie 时，进程一退出就没了 —— 表现就是
+    /// 每次杀掉/重启 App 都要重新登录。持久 Cookie 的代价是 pass hash
+    /// 会落在容器里（1.3.1 及更早的行为），换来登录稳定。
+    private static let persistAuthCookies = true
+
     private init() {
         storage = HTTPCookieStorage.shared
         // 先把钥匙串里的凭据放回 Cookie 罐——它们是会话 Cookie，
@@ -76,7 +84,9 @@ public final class EhCookieManager: @unchecked Sendable {
                                       passHash: existing[Self.keyIPBPassHash],
                                       igneous: igneous)
             let saved = EhCredentialStore.save(creds)
-            if saved && EhCredentialStore.load() != nil {
+            if Self.persistAuthCookies {
+                rewriteAuthCookiesAsPersistent(creds)
+            } else if saved && EhCredentialStore.load() != nil {
                 rewriteAuthCookiesAsSession(creds)
             } else {
                 EhCookieManager.credentialPersistenceFailed = true
@@ -85,7 +95,11 @@ public final class EhCookieManager: @unchecked Sendable {
         }
 
         guard let creds = EhCredentialStore.load(), !creds.isEmpty else { return }
-        rewriteAuthCookiesAsSession(creds)
+        if Self.persistAuthCookies {
+            rewriteAuthCookiesAsPersistent(creds)
+        } else {
+            rewriteAuthCookiesAsSession(creds)
+        }
     }
 
     /// 同步写入一个 Cookie。
@@ -100,7 +114,7 @@ public final class EhCookieManager: @unchecked Sendable {
             .name: name, .value: value, .domain: domain, .path: path, .secure: "TRUE",
         ]
         if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable,
-           !forcePersistent, !Self.credentialPersistenceFailed {
+           !Self.persistAuthCookies, !forcePersistent, !Self.credentialPersistenceFailed {
             properties[.discard] = "TRUE"
         } else {
             properties[.expires] = Date.distantFuture
@@ -230,7 +244,7 @@ public final class EhCookieManager: @unchecked Sendable {
             .secure: "TRUE",
         ]
         if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable,
-           !Self.credentialPersistenceFailed {
+           !Self.persistAuthCookies, !Self.credentialPersistenceFailed {
             // 认证 Cookie 写成会话 Cookie：不落盘，容器里的
             // Cookies.binarycookies 因此不再有明文 pass hash。
             // 持久副本在钥匙串里，下次启动由它恢复。
@@ -276,6 +290,15 @@ public final class EhCookieManager: @unchecked Sendable {
     public func secureAuthCookies() -> Bool {
         let creds = EhCredentials(memberId: memberId, passHash: passHash, igneous: igneous)
         guard !creds.isEmpty else { return false }
+
+        // 兼容模式：登录凭据同时写钥匙串（尽力）和持久 Cookie。
+        // 不走「会话 Cookie + 钥匙串」那条路，避免重签后钥匙串不可用导致登出。
+        if Self.persistAuthCookies {
+            _ = EhCredentialStore.save(creds)
+            removePersistedAuthCookies()
+            rewriteAuthCookiesAsPersistent(creds)
+            return true
+        }
 
         // 钥匙串用不上：保持持久 Cookie，保证重启后还在
         guard EhCredentialStore.isAvailable else {
