@@ -375,6 +375,10 @@ struct PasswordLoginView: View {
             EhCookieManager.shared.syncLoginCookies()
             EhCookieManager.shared.injectNWCookie()
 
+            // 主动访问 exhentai.org 获取 igneous cookie
+            // igneous 只有在实际访问 ExHentai 并成功验证后才会由服务器设置
+            try? await fetchIgneousCookie()
+
             // 保存用户信息
             AppSettings.shared.isLogin = true
             AppSettings.shared.displayName = displayName
@@ -406,6 +410,36 @@ struct PasswordLoginView: View {
         }
 
         isLoading = false
+    }
+
+    /// 登录后主动访问 ExHentai 获取 igneous cookie
+    /// igneous 是 ExHentai 访问权限的关键，只有在实际访问 exhentai.org 时服务器才会设置
+    private func fetchIgneousCookie() async throws {
+        guard let url = URL(string: "https://exhentai.org/") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 10
+
+        // 发起请求，让服务器设置 igneous cookie
+        let (_, response) = try await URLSession.shared.data(for: request)
+
+        // 检查是否成功获取 igneous
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode == 200,
+           let igneous = EhCookieManager.shared.igneous,
+           !igneous.isEmpty,
+           igneous.lowercased() != "mystery" {
+            // igneous 获取成功，保存到所有存储
+            let creds = EhCredentials(
+                memberId: EhCookieManager.shared.memberId,
+                passHash: EhCookieManager.shared.passHash,
+                igneous: igneous
+            )
+            _ = EhCredentialStore.save(creds)
+            _ = EhCredentialFileStore.save(creds)
+        }
     }
 
 }
@@ -474,9 +508,12 @@ struct WebViewLoginView: View {
         }
     }
 
-    /// 登录后的异步设置：获取用户资料
+    /// 登录后的异步设置：获取用户资料 + igneous cookie
     /// ExH 检测由 RootView 统一处理
     private func postLoginSetup() async {
+        // 主动获取 igneous cookie（ExHentai 访问权限）
+        try? await fetchIgneousCookie()
+
         // 获取用户资料 (displayName, avatar)
         do {
             let profile = try await EhAPI.shared.getProfile()
@@ -949,10 +986,16 @@ struct CookieLoginView: View {
             cookieManager.setCookie(name: EhCookieManager.keyIgneous, value: igneous, domain: EhCookieManager.domainExhentai)
         }
 
-        // 落到钥匙串。setCookie 写的是会话 Cookie，不持久化，
-        // 不存钥匙串的话下次启动就登出了。
-        cookieManager.persistCredentials()
+        // 保存到所有存储（钥匙串 + 文件备份）
+        cookieManager.secureAuthCookies()
         warnIfCredentialsNotPersisted()
+
+        // 如果用户没有提供 igneous，主动获取一次
+        if cookies.igneous == nil || cookies.igneous?.isEmpty == true {
+            Task {
+                try? await fetchIgneousCookie()
+            }
+        }
 
         AppSettings.shared.isLogin = true
         appState.isSignedIn = true
