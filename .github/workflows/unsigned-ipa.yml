@@ -1,0 +1,137 @@
+# ────────────────────────────────────────────────────────────
+#  未签名 IPA 构建（给没有 Mac 的人用）
+#
+#  用途：在 GitHub 的 macOS runner 上编译，产出一个没有签名的
+#        .ipa。下载到 Windows 后，用 Sideloadly / AltStore 以
+#        自己的 Apple ID 重签安装。
+#
+#  为什么不用 deploy_ios.yml：那条流水线需要付费开发者账号的
+#  证书、描述文件和 App Store Connect 密钥。这里全部跳过签名，
+#  只负责“把代码编成可安装的包”。
+# ────────────────────────────────────────────────────────────
+
+name: Unsigned IPA
+
+on:
+  # 只手动触发：每次 push 都编一个包既慢又浪费额度
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "主 App 的 Bundle ID，留空则用 io.github.<你的用户名>.ehviewer"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 和 build.yml 一样：选镜像上最新的 Xcode。
+      # 工程的 macOS 部署目标是 26.2，需要足够新的 SDK。
+      - name: Select newest Xcode
+        run: |
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          LATEST=${LATEST:-/Applications/Xcode.app}
+          sudo xcode-select -s "$LATEST"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+
+      # 作者的 Bundle ID 已在 Apple 注册，别人的账号无法再用。
+      # 这里在 CI 里临时替换，不改仓库里的工程文件。
+      - name: Choose unique bundle identifier
+        id: bundle
+        env:
+          INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          BUNDLE_ID="${INPUT_BUNDLE_ID:-io.github.${OWNER_LC}.ehviewer}"
+
+          # 只接受反向域名常用字符，避免 sed 注入
+          if ! echo "$BUNDLE_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*$'; then
+            echo "::error::Bundle ID 只能包含字母、数字、点和连字符，且不能以点开头：$BUNDLE_ID"
+            exit 1
+          fi
+
+          echo "使用 Bundle ID: $BUNDLE_ID"
+          echo "value=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite bundle identifiers in project
+        env:
+          BUNDLE_ID: ${{ steps.bundle.outputs.value }}
+        run: |
+          set -euo pipefail
+          # 一次性替换主 App 前缀；widget 的 ID 是
+          # Stellatrix.ehviewer-apple.EhDownloadWidget，会跟着变成
+          # <你的前缀>.EhDownloadWidget，测试 target 同理。
+          /usr/bin/sed -i '' "s/Stellatrix\.ehviewer-apple/${BUNDLE_ID}/g" \
+            "ehviewer apple.xcodeproj/project.pbxproj"
+
+          # 这两个后台任务 ID 必须与 Info.plist 里的
+          # BGTaskSchedulerPermittedIdentifiers（$(PRODUCT_BUNDLE_IDENTIFIER).download
+          # / .refresh）一致，否则 BGTaskScheduler.register 会在启动时直接抛异常。
+          /usr/bin/sed -i '' "s/Stellatrix\.ehviewer-apple/${BUNDLE_ID}/g" \
+            "ehviewer apple/BackgroundDownloadManager.swift" \
+            "ehviewer apple/LogManager.swift"
+
+          grep -n "PRODUCT_BUNDLE_IDENTIFIER" "ehviewer apple.xcodeproj/project.pbxproj"
+          echo "--- 剩余的作者标识（应为空）---"
+          ! grep -rn "Stellatrix\.ehviewer-apple" \
+            "ehviewer apple.xcodeproj/project.pbxproj" \
+            "ehviewer apple/BackgroundDownloadManager.swift" \
+            "ehviewer apple/LogManager.swift"
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project "ehviewer apple.xcodeproj" \
+            -scheme "ehviewer apple"
+
+      # 归档阶段完全不签名。产物里的 .app 没有签名，
+      # 由 Sideloadly 在 Windows 上用你自己的证书重签。
+      - name: Archive (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "ehviewer apple.xcodeproj" \
+            -scheme "ehviewer apple" \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/EhViewer.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      # IPA 的本质就是一个 zip，里面是 Payload/<App>.app。
+      # 用 ditto 而不是 zip，保留符号链接和扩展属性。
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find "$RUNNER_TEMP/EhViewer.xcarchive/Products/Applications" \
+            -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::归档里没有找到 .app"
+            exit 1
+          fi
+          echo "App: $APP_PATH"
+
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          ditto -c -k --sequesterRsrc --keepParent Payload EhViewer-unsigned.ipa
+          ls -lh EhViewer-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: EhViewer-unsigned-ipa-${{ github.run_number }}
+          path: ${{ runner.temp }}/EhViewer-unsigned.ipa
+          retention-days: 7
+          if-no-files-found: error
