@@ -43,6 +43,7 @@ jobs:
           xcodebuild test \
             -project "ehviewer apple.xcodeproj" \
             -scheme "Issue15" \
+            -configuration Release \
             -destination "platform=iOS Simulator,name=$DEVICE,OS=latest" \
             -only-testing:'ehviewer appleUITests/Issue15ReproTests/testHomeScrollToBottom' \
             -resultBundlePath "$RUNNER_TEMP/Issue15.xcresult" \

@@ -44,17 +44,19 @@ final class Issue15ReproTests: XCTestCase {
         }
 
         // 一直往上滑，滑到底部触发 loadMore
-        for i in 0..<45 {
+        for i in 0..<70 {
             guard app.state == .runningForeground else {
                 add(XCTAttachment(screenshot: app.screenshot()))
                 XCTFail("第 \(i) 次上滑前 App 已不在前台，state=\(app.state.rawValue)")
                 return
             }
             list.swipeUp(velocity: .fast)
-            Thread.sleep(forTimeInterval: 0.3)
+            Thread.sleep(forTimeInterval: 0.15)
         }
 
-        Thread.sleep(forTimeInterval: 5)
+        // 停在底部，让 loadMore / 追加行充分执行
+        Thread.sleep(forTimeInterval: 8)
+        add(XCTAttachment(screenshot: app.screenshot()))
         XCTAssertEqual(app.state, .runningForeground, "滚到底后 App 崩溃")
     }
 }
